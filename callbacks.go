@@ -2,20 +2,20 @@ package otgorm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"google.golang.org/grpc/codes"
-
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
-	"go.opentelemetry.io/otel/api/core"
-	"go.opentelemetry.io/otel/api/global"
-	"go.opentelemetry.io/otel/api/trace"
 )
 
 //Attributes that may or may not be added to a span based on Options used
 const (
-	TableKey = core.Key("gorm.table") //The table the GORM query is acting upon
-	QueryKey = core.Key("gorm.query") //The GORM query itself
+	TableKey = attribute.Key("gorm.table") //The table the GORM query is acting upon
+	QueryKey = attribute.Key("gorm.query") //The GORM query itself
 )
 
 type callbacks struct {
@@ -30,13 +30,13 @@ type callbacks struct {
 	table bool
 
 	//List of default attributes to include onto the span for DB calls
-	defaultAttributes []core.KeyValue
+	defaultAttributes []attribute.KeyValue
 
 	//tracer creates spans. This is required
 	tracer trace.Tracer
 
 	//List of default options spans will start with
-	spanStartOptions []trace.StartOption
+	spanOptions []trace.SpanStartOption
 }
 
 //Gorm scope keys for passing around context and span within the DB scope
@@ -58,10 +58,10 @@ func (fn OptionFunc) apply(c *callbacks) {
 }
 
 //WithSpanOptions configures the db callback functions with an additional set of
-//trace.StartOptions which will be applied to each new span
-func WithSpanOptions(opts ...trace.StartOption) OptionFunc {
+//trace.SpanStartOption which will be applied to each new span
+func WithSpanOptions(opts ...trace.SpanStartOption) OptionFunc {
 	return func(c *callbacks) {
-		c.spanStartOptions = opts
+		c.spanOptions = opts
 	}
 }
 
@@ -95,19 +95,19 @@ func (t Table) apply(c *callbacks) {
 }
 
 // DefaultAttributes sets attributes to each span.
-type DefaultAttributes []core.KeyValue
+type DefaultAttributes []attribute.KeyValue
 
 func (d DefaultAttributes) apply(c *callbacks) {
-	c.defaultAttributes = []core.KeyValue(d)
+	c.defaultAttributes = []attribute.KeyValue(d)
 }
 
 // RegisterCallbacks registers the necessary callbacks in Gorm's hook system for instrumentation with OpenTelemetry Spans.
 func RegisterCallbacks(db *gorm.DB, opts ...Option) {
 	c := &callbacks{
-		defaultAttributes: []core.KeyValue{},
+		defaultAttributes: []attribute.KeyValue{},
 	}
 	defaultOpts := []Option{
-		WithTracer(global.TraceProvider().Tracer("otgorm")),
+		WithTracer(otel.Tracer("otgorm")),
 		WithSpanOptions(trace.WithSpanKind(trace.SpanKindInternal)),
 	}
 
@@ -125,7 +125,7 @@ func RegisterCallbacks(db *gorm.DB, opts ...Option) {
 	db.Callback().Delete().After("gorm:delete").Register("after_delete", c.afterDelete)
 }
 
-func (c *callbacks) before(scope *gorm.Scope, operation string) {
+func (c *callbacks) before(scope *gorm.DB, operation string) {
 	rctx, _ := scope.Get(contextScopeKey)
 	ctx, ok := rctx.(context.Context)
 	if !ok || ctx == nil {
@@ -137,14 +137,11 @@ func (c *callbacks) before(scope *gorm.Scope, operation string) {
 	scope.Set(contextScopeKey, ctx)
 }
 
-func (c *callbacks) after(scope *gorm.Scope) {
+func (c *callbacks) after(scope *gorm.DB) {
 	c.endTrace(scope)
 }
 
-func (c *callbacks) startTrace(ctx context.Context, scope *gorm.Scope, operation string) context.Context {
-	//Start with configured span options
-	opts := append([]trace.StartOption{}, c.spanStartOptions...)
-
+func (c *callbacks) startTrace(ctx context.Context, scope *gorm.DB, operation string) context.Context {
 	// There's no context but we are ok with root spans
 	if ctx == nil {
 		ctx = context.Background()
@@ -158,23 +155,17 @@ func (c *callbacks) startTrace(ctx context.Context, scope *gorm.Scope, operation
 
 	var span trace.Span
 
-	if parentSpan == nil {
-		ctx, span = c.tracer.Start(
-			context.Background(),
-			fmt.Sprintf("gorm:%s", operation),
-			opts...,
-		)
-	} else {
-		opts = append(opts, trace.ChildOf(parentSpan.SpanContext()))
-		ctx, span = c.tracer.Start(ctx, fmt.Sprintf("gorm:%s", operation), opts...)
-	}
-
+	ctx, span = c.tracer.Start(
+		ctx,
+		fmt.Sprintf("gorm:%s", operation),
+		c.spanOptions...,
+	)
 	scope.Set(spanScopeKey, span)
 
 	return ctx
 }
 
-func (c *callbacks) endTrace(scope *gorm.Scope) {
+func (c *callbacks) endTrace(scope *gorm.DB) {
 	rspan, ok := scope.Get(spanScopeKey)
 	if !ok {
 		return
@@ -189,37 +180,39 @@ func (c *callbacks) endTrace(scope *gorm.Scope) {
 	attributes := c.defaultAttributes
 
 	if c.table {
-		attributes = append(attributes, TableKey.String(scope.TableName()))
+		attributes = append(attributes, TableKey.String(scope.Statement.Table))
 	}
 
 	if c.query {
-		attributes = append(attributes, QueryKey.String(scope.SQL))
+		attributes = append(attributes, QueryKey.String(scope.Statement.SQL.String()))
 	}
 	span.SetAttributes(attributes...)
 
 	//Set StatusCode if there are any issues
-	var code codes.Code
-	if scope.HasError() {
-		err := scope.DB().Error
-		if gorm.IsRecordNotFoundError(err) {
-			code = codes.NotFound
+
+	if scope.Error != nil {
+		var code codes.Code
+		var message string
+		err := scope.Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			code = codes.Error
+			message = "not found"
 		} else {
-			code = codes.Unknown
+			code = codes.Unset
+			message = "unknown"
 		}
 
+		span.SetStatus(code, message)
 	}
 
-	span.SetStatus(code)
-
-	//End Span
 	span.End()
 }
 
-func (c *callbacks) beforeCreate(scope *gorm.Scope) { c.before(scope, "create") }
-func (c *callbacks) afterCreate(scope *gorm.Scope)  { c.after(scope) }
-func (c *callbacks) beforeQuery(scope *gorm.Scope)  { c.before(scope, "query") }
-func (c *callbacks) afterQuery(scope *gorm.Scope)   { c.after(scope) }
-func (c *callbacks) beforeUpdate(scope *gorm.Scope) { c.before(scope, "update") }
-func (c *callbacks) afterUpdate(scope *gorm.Scope)  { c.after(scope) }
-func (c *callbacks) beforeDelete(scope *gorm.Scope) { c.before(scope, "delete") }
-func (c *callbacks) afterDelete(scope *gorm.Scope)  { c.after(scope) }
+func (c *callbacks) beforeCreate(scope *gorm.DB) { c.before(scope, "create") }
+func (c *callbacks) afterCreate(scope *gorm.DB)  { c.after(scope) }
+func (c *callbacks) beforeQuery(scope *gorm.DB)  { c.before(scope, "query") }
+func (c *callbacks) afterQuery(scope *gorm.DB)   { c.after(scope) }
+func (c *callbacks) beforeUpdate(scope *gorm.DB) { c.before(scope, "update") }
+func (c *callbacks) afterUpdate(scope *gorm.DB)  { c.after(scope) }
+func (c *callbacks) beforeDelete(scope *gorm.DB) { c.before(scope, "delete") }
+func (c *callbacks) afterDelete(scope *gorm.DB)  { c.after(scope) }

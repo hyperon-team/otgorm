@@ -3,34 +3,31 @@ package otgorm
 import (
 	"fmt"
 
-	"go.opentelemetry.io/otel/api/core"
-	"go.opentelemetry.io/otel/api/key"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 //CreateSpanAttribute creates a KeyValue for use as a span attribute
-func CreateSpanAttribute(k string, v interface{}) (kv core.KeyValue) {
+func CreateSpanAttribute(k string, v interface{}) (kv attribute.KeyValue) {
 	switch x := v.(type) {
 	case string:
-		return key.New(k).String(v.(string))
 	case bool:
-		return key.New(k).Bool(v.(bool))
+		return attribute.Bool(k, x)
 	case int64:
-		return key.New(k).Int64(v.(int64))
+		return attribute.Int64(k, x)
 	case int32:
-		return key.New(k).Int32(v.(int32))
+		return attribute.Int(k, int(x))
 	case int:
-		return key.New(k).Int(v.(int))
+		return attribute.Int(k, x)
 	case float64:
-		return key.New(k).Float64(v.(float64))
+		return attribute.Float64(k, x)
 	case float32:
-		return key.New(k).Float32(v.(float32))
+		return attribute.Float64(k, float64(x))
 	case uint:
-		return key.New(k).Uint(v.(uint))
+		return attribute.Int(k, int(x))
 	case uint64:
-		return key.New(k).Uint64(v.(uint64))
+		return attribute.Int64(k, int64(x))
 	case uint32:
-		return key.New(k).Uint32(v.(uint32))
-	default:
-		return key.New("attribute.error").String(fmt.Sprintf("Couldn't convert %s into KeyValue", x))
+		return attribute.Int(k, int(x))
 	}
+	return attribute.String("attribute.error", fmt.Sprintf("couldn't convert %s into KeyValue", v))
 }
