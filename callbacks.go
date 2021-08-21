@@ -6,7 +6,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 
-	"github.com/jinzhu/gorm"
+	"gorm.io/gorm"
 	"go.opentelemetry.io/otel/api/core"
 	"go.opentelemetry.io/otel/api/global"
 	"go.opentelemetry.io/otel/api/trace"
